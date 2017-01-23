@@ -7,12 +7,12 @@
 #include <stdbool.h>
 #include "err.h"
 
+/* Types and structures to represent circuit */
 typedef enum NodeType {
   PNUM, VAR, UNARY, BINARY, UNRECOGNIZED_TYPE_ERR
 } NodeType;
 
 typedef union {
-    int num;
     int var;
     char op;
 } Label;
@@ -25,76 +25,70 @@ typedef struct Node {
 
 struct Circuit {
   int V;
-  //for 0<=i<V variable[i] is an array of nodes labeled with X[i] variable, variable[V] is
   //a list of all the nodes allocated within program, handy in terms of resource management
-  ParseTree **variables; // variable[i] is an array of nodes labeled with X[i] variable
-  size_t *list_len; //number on nodes in a variable[i] array
-  size_t *list_cap; //capacity of variable[i] array
+  ParseTree *variables;
+  size_t list_len; //number on nodes in a variables array
+  size_t list_cap; //capacity of variables
   ParseTree *trees; //x[0], .., x[V - 1] varaibles as a roots of trees representing its equations
 } circuit;
 
+
+/* Initiates [circuit] structure making allowance for arguments passed by user */
 int init_circuit(int V) {
-  int const DEFAULT_CAP = 2;
-  int const DEFAULT_BUF_CAP = 2*V;
+  int DEFAULT_BUF_CAP = 2*V;
   circuit.V = V;
-  circuit.list_len = (size_t *) calloc(V + 1, sizeof(*circuit.list_len));
-  circuit.list_cap = (size_t *) calloc(V + 1, sizeof(*circuit.list_cap));
-  circuit.variables = (ParseTree **) calloc(V + 1, sizeof(*circuit.variables));
-  if (circuit.variables == NULL || circuit.list_len == NULL || circuit.list_cap == NULL)
+  circuit.variables = (ParseTree *) calloc(DEFAULT_BUF_CAP, sizeof(*circuit.variables));
+  if (circuit.variables == NULL)
     return -1;
-  for (int v=0; v<V; v++) {
-    circuit.variables[v] = (ParseTree *) calloc(DEFAULT_CAP, sizeof(*circuit.variables[v]));
-    if (circuit.variables[v] == NULL)
-      return -1;
-    circuit.list_cap[v] = DEFAULT_CAP;
-  }
-  circuit.variables[V] = (ParseTree *) calloc(DEFAULT_BUF_CAP, sizeof(*circuit.variables[V])); 
-  circuit.list_cap[V] = DEFAULT_BUF_CAP;
+  circuit.list_cap = DEFAULT_BUF_CAP;
   circuit.trees = (ParseTree *) calloc(V, sizeof(*circuit.trees));
-  if (circuit.variables[V] == NULL || circuit.trees == NULL)
+  if (circuit.trees == NULL)
     return -1;
   return 0;
 }
 
+/* Frees memory storing [circuit] elements. */
 void free_circuit() {
   free(circuit.trees);
-  for (int i=0; i<circuit.list_len[circuit.V]; i++)
-    free(circuit.variables[circuit.V][i]);
-  for (int v=0; v<=circuit.V; v++) {
-    if (circuit.variables[v] == NULL)
-      break;
-    free(circuit.variables[v]);
-  }
   free(circuit.variables);
-  free(circuit.list_cap);
-  free(circuit.list_len);
 }
 
-int register_node(int v, ParseTree t) {
-  if (circuit.list_cap[v] == circuit.list_len[v]) {
-    size_t nsize = circuit.list_cap[v] * 2;
-    ParseTree *narray = (ParseTree *) realloc(circuit.variables[v],
-                                              sizeof(circuit.variables[v]) * nsize);
+/* Frees memeory used to store nodes that have been registered when created. */
+void free_nodes() {
+  for (int i=circuit.list_len-1; i>=0; i--)
+    free(circuit.variables[i]);
+}
+
+/* Adds [t] to the list of nodes that should be deleted if [free_nodes] is evoked. */
+int register_node(ParseTree t) {
+  if (circuit.list_cap == circuit.list_len) {
+    size_t nsize = circuit.list_cap * 2;
+    ParseTree *narray = (ParseTree *) realloc(circuit.variables,
+                                              sizeof(*circuit.variables) * nsize);
     if (narray == NULL)
       return -1;
-    circuit.variables[v] = narray;
-    circuit.list_cap[v] = nsize;
+    circuit.variables = narray;
+    circuit.list_cap = nsize;
   }
-  circuit.variables[v][circuit.list_len[v]++] = t;
+  circuit.variables[circuit.list_len++] = t;
   return 0;
 }
 
+/* Create node of given type and label, it will be registered and thus deleted
+   if [free_nodes] is evoked */
 ParseTree new_tree(NodeType type, Label label) { 
   ParseTree tree = NULL;
   tree = (ParseTree) calloc(1, sizeof(*tree));
   if (tree == NULL)
     return NULL;
-  register_node(circuit.V, tree);
+  register_node(tree);
   tree->label = label;
   tree->type = type;
   return tree;
 }
 
+/* Gets first element of grammar alphabet from line sufix, stores it in [label] and returns
+  the type of the match */
 NodeType retrieve_var(char **line, Label *label) {
   NodeType type = UNRECOGNIZED_TYPE_ERR;
   while (**line != '\0' && isspace(**line)) {
@@ -109,8 +103,8 @@ NodeType retrieve_var(char **line, Label *label) {
   }
   else if (isdigit(**line)) {
     int n = atoi(*line);
-    while (isdigit(*(*line)++));
-    label->num = n;
+    while (isdigit(*(++(*line))));
+    label->var = n;
     type = PNUM;
   }
   else if (**line == '+' || **line == '*') {
@@ -121,60 +115,115 @@ NodeType retrieve_var(char **line, Label *label) {
   else if (**line == '-') {
     label->op = **line;
     type = UNARY;
+    ++(*line);
   }
   return type;
 }
 
-ParseTree parse_line(ParseTree nop, ParseTree op, char *line, int blevel) {
-  while (*line != '\0') {
+/*[line] is a sufix which has yet to be procesed
+  [op] and [nop] are tops of stacks that keep respectively opeators and variables/numerals. */
+ParseTree parse_line(char **line, ParseTree op, ParseTree nop) {
+  while (**line != '\0' && (isspace(**line) || **line == '(')) {
+    ++(*line);
+  }
+  // end of currently processed expression, pop the operator and combine it variable from top, if
+  // the operator is binary one it will have its left child added in the parent of recursion tree
+  if (**line == ')') { 
+    ++(*line);
+    op->right = nop;
+    return op;
+  }
+  else if (**line != '\0') {
     Label label;
     NodeType nodetype;
-    while (*line != '\0' && (isspace(*line) || *line == '(')) {
-      ++line;
-      blevel += (*line == '(');
-    }
-    if (*line == ')') {
-      if (blevel == 0)
-        return NULL;
-      --blevel;
-      return nop;
-    }
-    if ((nodetype = retrieve_var(&line, &label)) == UNRECOGNIZED_TYPE_ERR)
+    if ((nodetype = retrieve_var(line, &label)) == UNRECOGNIZED_TYPE_ERR) //error
       return NULL;
+    ParseTree tree = new_tree(nodetype, label);
+    if (nodetype == PNUM || nodetype == VAR) {
+      // if its variable or numeral put it on the top of the [nop] stack
+      return parse_line(line, op, tree);
+    }
+    else { //nodetype is either BINARY or UNARY
+      // both types of operators need to be joined with expression that follows them, so put it
+      // on the top of [op] stack
+      ParseTree op_joined_with_var = parse_line(line, tree, NULL);
+      // and binary ones need join with the preceeding expression as well
+      if (nodetype == BINARY)
+        op_joined_with_var->left = nop;
+      // put parsed subtree on the top of [nop] stack
+      return parse_line(line, op, op_joined_with_var);
+    }
   }
-  int var = retrieve_var(&line);
-  printf("x[%d]\n", var);
-  return 0;
+  return nop;
 }
 
+void print_tree(ParseTree t) {
+  if(t == NULL) {
+    printf ("UUUUBS!\n");
+    exit(1);
+  }
+  if (t->type == BINARY) {
+    if(t->left == NULL || t->right == NULL) {
+      printf("ERRRR %c %d %d\n", t->label.op, t->left == NULL, t->right==NULL);
+      exit(1);
+    }
+    printf("(");
+    print_tree(t->left);
+    printf(" %c ", t->label.op);
+    print_tree(t->right);
+    printf(")");
+  }
+  else if (t->type == UNARY) {
+    if (t->left != NULL || t->right == NULL) {
+      printf ("ERRR %c %d %d\n", t->label.op, t->left == NULL, t->right == NULL);
+      exit(1);
+    }
+    printf("(%c", t->label.op);
+    print_tree(t->right);
+    printf(")");
+  }
+  else if (t->type == PNUM) {
+    printf("%d", t->label.var);
+  }
+  else if (t->type == VAR) {
+    printf("x[%d]", t->label.var);
+  }
+  else {
+    printf("TYPE!!!!\n");
+    exit(1);
+  }
+}
 
-// and now somethng completely different
+/* And now somethng completely different. */
 void looming_doom() {
+  free_nodes();
   free_circuit();
 }
 
 int main() {
-  int N, K, V;
+  int N, K, V, nr;
   scanf("%d%d%d", &N, &K, &V);
-  if (init_circuit(V + 1) == 0) {
+  if (init_circuit(V) == 0) {
     char *line = NULL;
     size_t len = 0;
     for (int k=1; k<=K; k++) {
-      int nr;
       scanf("%d", &nr);
       if (getline(&line, &len, stdin) < 0)
         break;
       char *mock_line = line;
       Label label;
-      NodeType nodetype = retrieve_var(&mock_line, &label);
-      if (nodetype == VAR) // right side of equation ought to be x[]
+      NodeType nodetype = retrieve_var(&mock_line, &label); //left side of equation
+      if (nodetype != VAR || circuit.trees[label.var] != NULL) {
+        printf ("%d F", nr);
         break;
-      while(*mock_line != '\0' && (isspace(*mock_line) || *mock_line == '='))
+      }
+      while (*mock_line != '\0' && (isspace(*mock_line) || *mock_line == '='))
         ++mock_line;
-      ParseTree tree = parse_line(mock_line, NULL, NULL);
-      if (tree = NULL)
+      ParseTree tree = parse_line(&mock_line, NULL, NULL);
+      if (tree == NULL)
         break;
-      circuit.tree[label.var] = tree;
+      print_tree(tree);
+      circuit.trees[label.var] = tree;
     }
     free(line);
   }
