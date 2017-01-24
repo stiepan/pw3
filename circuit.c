@@ -21,25 +21,37 @@ typedef struct Node {
   NodeType type;
   Label label;
   struct Node *left, *right;
+  bool is_root; //of some parse tree
+  int id; //unqiue of registered nodes
   bool visited;
-  bool is_root;
-  int post;
-  int id;
-  //if node is a root this pipes connect it with nodes labeled with varaible it represents
-  int *root_pipes_w;
-  int *root_pipes_r;
-  //if node is a leaf labeled with variable it is the index to root_pipe of corresponding tree
+  int post; //in some topological order
+  //pipes fall into two different categories: propagated and not, the first need to be opened
+  //when creating processes tree, because need to be propagated down it to make connection
+  //between 1. descendants (root x and leaves labaleed with x), 2.circuit and leaves labelled with x
+  //the second category comprises pipes parallel to process tree edges, close them as soon as possbile
+  /* propagated pipes - these are stored only in root nodes, var leaf knows index in corresponidng array */
+  int *root_write_to_var; //root nodes use them to message var leaves
+  int *root_read_from_var;
+  int *var_write_to_root; //var leaves use them to message root
+  int *var_read_from_root;
+  //if node is a leaf labeled with variable it is the index in array of pipes in corresponding tree
+  //if there is such a tree of course
   int pipe_id;
   int pipes_counter;
   int pipes_list_cap;
-  //pipes to communicate circuit with variables roots 
-  int read; //from circuit
-  int write; //to root
-  int pnum_pipes[2]; //if you are a pnum, circut must message you there's propagation needed
+  //communication between var leaf and circuit
+  int var_read_from_circuit;
+  int var_write_to_circuit;
+  int circuit_write_to_var;
+  int circuit_read_from_var;
+  /* not propagated pipes - parallel to edges in process tree */ 
+  int parent_read_from_me;
+  int parent_write_to_me;
+  int read_from_parent;
+  int write_to_parent;
 } *ParseTree;
 
 struct Circuit {
-  int V;
   //a list of all the nodes allocated within program, handy in terms of resource management
   ParseTree *variables;
   size_t list_len; //number on nodes in a variables array
@@ -57,9 +69,8 @@ typedef struct {
 int N, K, V, nr;
 
 /* Initiates [circuit] structure making allowance for arguments passed by user */
-int init_circuit(int V) {
+int init_circuit() {
   int DEFAULT_BUF_CAP = 2*V;
-  circuit.V = V;
   circuit.variables = (ParseTree *) calloc(DEFAULT_BUF_CAP, sizeof(*circuit.variables));
   if (circuit.variables == NULL)
     return -1;
@@ -74,9 +85,11 @@ int init_circuit(int V) {
 /* Frees memory storing [circuit] elements and removes all registered nodes. */
 void free_circuit() {
   for (int i=circuit.list_len-1; i>=0; i--) {
-    if (circuit.variables[i]->root_pipes_w != NULL) {
-      free(circuit.variables[i]->root_pipes_w);
-      free(circuit.variables[i]->root_pipes_r);
+    if (circuit.variables[i]->root_write_to_var != NULL) {
+      free(circuit.variables[i]->root_write_to_var);
+      free(circuit.variables[i]->root_read_from_var);
+      free(circuit.variables[i]->var_read_from_root);
+      free(circuit.variables[i]->var_write_to_root);
     }
     free(circuit.variables[i]);
   }
@@ -103,7 +116,7 @@ int register_node(ParseTree t) {
 
 /* Create node of given type and label, it will be registered and thus deleted
    if [free_nodes] is evoked */
-ParseTree new_tree(NodeType type, Label label) { 
+ParseTree new_tree(NodeType type, Label label) {
   ParseTree tree = NULL;
   tree = (ParseTree) calloc(1, sizeof(*tree));
   if (tree == NULL)
@@ -216,13 +229,13 @@ int dfs(ParseTree tree, int root_id) {
 
 int topo_sort() {
   circuit.topo_ord_len = 0;
-  for (int v=0; v<circuit.V; v++) {
+  for (int v=0; v<V; v++) {
     if (circuit.trees[v] != NULL) {
       circuit.trees[v]->visited = false;
       circuit.trees[v]->post = -1;
     }
   }
-  for (int v=0; v<circuit.V; v++) {
+  for (int v=0; v<V; v++) {
     if (circuit.trees[v] != NULL && (!(circuit.trees[v]->visited))) {
       if (dfs(circuit.trees[v], v) < 0)
         return -1;
@@ -277,33 +290,47 @@ void print_topo() {
 }
 \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\*/
 
+// Creates pipes between x root nad x labeled leaf
 int register_pipe(ParseTree varLabeledLeaf) {
   int v = varLabeledLeaf->label.var;
   ParseTree root = circuit.trees[v];
-  if (root->root_pipes_w == NULL) {
+  if (root->root_read_from_var == NULL) {
     int DEFAULT_PIPES_QUANT = 1;
-    root->root_pipes_w = (int *) calloc(DEFAULT_PIPES_QUANT, sizeof(*(root->root_pipes_w)));
-    root->root_pipes_r = (int *) calloc(DEFAULT_PIPES_QUANT, sizeof(*(root->root_pipes_r)));
+    root->root_read_from_var = (int *) calloc(DEFAULT_PIPES_QUANT, sizeof(*(root->root_read_from_var)));
+    root->root_write_to_var = (int *) calloc(DEFAULT_PIPES_QUANT, sizeof(*(root->root_write_to_var)));
+    root->var_read_from_root = (int *) calloc(DEFAULT_PIPES_QUANT, sizeof(*(root->var_read_from_root)));
+    root->var_write_to_root = (int *) calloc(DEFAULT_PIPES_QUANT, sizeof(*(root->var_write_to_root)));
+    int *arrays[4] = {root->root_read_from_var, root->root_write_to_var, root->var_read_from_root, root->var_write_to_root};
+    for (int i=0; i<4; i++) {
+      if (arrays[i] == NULL)
+        return -1;
+    }
     root->pipes_list_cap = DEFAULT_PIPES_QUANT;
   }
   else if (root->pipes_counter == root->pipes_list_cap) {
     int nsize = root->pipes_list_cap * 2;
-    int *n_w = realloc(root->root_pipes_w, sizeof(*(root->root_pipes_w))*nsize);
-    if (n_w == NULL)
-      return -1;
-    int *n_r = realloc(root->root_pipes_r, sizeof(*(root->root_pipes_r))*nsize);
-    if (n_r == NULL)
-      return -1;
-    root->root_pipes_w = n_w;
-    root->root_pipes_r = n_r;
+    int **arrays[4] = {&root->root_read_from_var, &root->root_write_to_var,
+                     &root->var_read_from_root, &root->var_write_to_root};
+    int *narrays[4];
+    for (int i=0; i<4; i++) {
+      narrays[i] = realloc(*arrays[i], sizeof(int)*nsize); 
+      if (narrays[i] == NULL)
+        return -1;
+    }
+    for (int i=0; i<4; i++) {
+      *arrays[i] = narrays[i];
+    }
     root->pipes_list_cap = nsize;
   }
-  int npipe[2];
-  if (pipe(npipe) < 0)
+  int w_to_root[2];
+  int w_to_var[2];
+  if (pipe(w_to_root) < 0 || pipe(w_to_var) < 0)
     return -1;
   varLabeledLeaf->pipe_id = root->pipes_counter;
-  root->root_pipes_r[root->pipes_counter] = npipe[0];
-  root->root_pipes_w[root->pipes_counter++] = npipe[1];
+  root->root_write_to_var[root->pipes_counter] = w_to_var[1];
+  root->var_read_from_root[root->pipes_counter] = w_to_var[0];
+  root->var_write_to_root[root->pipes_counter] = w_to_root[1];
+  root->root_read_from_var[root->pipes_counter++] = w_to_root[0];
   return 0;
 }
 
@@ -311,10 +338,15 @@ int extern_var(ParseTree tree) {
   if (tree->type == VAR) {
     if (circuit.trees[tree->label.var] != NULL && register_pipe(tree) < 0)
       return -1;
-  }
-  else if (tree->type == PNUM) {
-    if (pipe(tree->pnum_pipes) < 0)
+    // create pipes to circuit
+    int w_to_circuit[2];
+    int w_to_var[2];
+    if (pipe(w_to_circuit) < 0 || pipe(w_to_var) < 0)
       return -1;
+    tree->var_read_from_circuit = w_to_var[0];
+    tree->var_write_to_circuit = w_to_circuit[1];
+    tree->circuit_write_to_var = w_to_var[1];
+    tree->circuit_read_from_var = w_to_circuit[0];
   }
   else if (tree->type == BINARY || tree->type == UNARY) {
     if (extern_var(tree->right) < 0 || ((tree->type == BINARY) && (extern_var(tree->left) < 0)))
@@ -341,9 +373,13 @@ void looming_doom(char *ERR) {
   exit(0);
 }
 
-void listen(ParseTree self, int parent_dsc) {
-  int entries = 0;
-  if (self->is_root)
+void close_pipe_or_perish_any_hope(int pipe, char *err) {
+  if(close(pipe) < 0)
+    looming_doom(err);
+}
+
+void listen(ParseTree self) {
+  /*if (self->is_root)
     entries += 1;
   if (self->type == PNUM || self->type == UNARY)
     entries += 1;
@@ -352,62 +388,20 @@ void listen(ParseTree self, int parent_dsc) {
     Mes mes;
     while (read(self->pnum_pipes[0], &mes, sizeof(mes)))
       write(parent_dsc, &mes, sizeof(mes));
-  }
-  else if ()
+  }*/
 }
 
 /* Map ParseTree to process tree */ 
 void proc_node(ParseTree self, int x) {
-  // desc to parent or circut if t is the root
-  int parent = self->read;
-  int lpipes[2], rpipes[2];
-  bool parent_proc = false;
-  while (!parent_proc && (self->type == BINARY || self->type == UNARY)) {
-    if (pipe(rpipes) < 0) {
-      looming_doom("PIPES BETWEEN TREE NODES R");
-    }
-    switch (fork()) {
-      case -1:
-        looming_doom("FORK IN PROC_NODE");
-      case 0: 
-        close(rpipes[0]);
-        close(parent); // close socket to grandparent
-        parent = rpipes[1];
-        self = self->right;
-        break;
-      default: 
-        close(rpipes[1]);
-        parent_proc = true;
-    }
-    if (self->type == BINARY) {
-      if (pipe(lpipes) < 0) {
-        looming_doom("PIPES BETWEEN TREE NODES L");
-      }
-      switch (fork()) {
-        case -1:
-          looming_doom("FORK IN PROC_NODE");
-        case 0: 
-          self = self->left;
-          close(lpipes[0]);
-          close(rpipes[0]);
-          close(parent); // close socket to grandparent
-          parent = lpipes[1];
-          break;
-        default: 
-          close(lpipes[1]);
-      }
-    }
+/*  // close propagated descriptors from roots to variable nodes the given root describe
+  // fisrt if you are not a root you do not need non-tree descriptors that your root was given
+  if (!self->is_root) {
+    ParseTree root = circuit.trees[x];
+    for (int i=0; i<root->pipes_counter; i++)
+      close(root->root_pipes_w[i]);
   }
-  // close propagated descriptors from circuit to PNUM leaves (apart from the one for [self])
-  for (int i=0; i<circuit.list_len; i++) {
-    ParseTree node = circuit.variables[i];
-    if (node->type == PNUM && node->id != self->id) {
-      if (close(circuit.variables[i]->pnum_pipes[0]) < 0)
-        looming_doom("CLOSE READ PIPES FOR A PNUM LEAF");
-    }
-  }
-  // close propagated descriptors from roots to variable nodes the given root describe
-  for (int v=0; v<circuit.V; v++) {
+  // if you are a leaf of var v type you should be able to read from tree[v]
+  for (int v=0; v<V; v++) {
     if (circuit.trees[v] == NULL)
       continue;
     ParseTree t = circuit.trees[v];
@@ -420,83 +414,110 @@ void proc_node(ParseTree self, int x) {
       }
     }
   }
-  listen(self, parent);
+  listen(self, parent);*/
 }
 
-/* x:{X[0], .., X[V-1]}, listsq - quantity of initializations lists */
-void tree_process(int x, int listsq) {
-  // Close writting descriptors from roots to variables that are not yours
-  for (int v=0; v<circuit.V; v++) {
-    if (v == x || circuit.trees[v] == NULL)
+/* x:{X[0], .., X[V-1]} */
+void processes_tree(int x) {
+  //Tree x defienietly doesn't need other trees' descriptors to write to var labeled leaves 
+  ParseTree self = circuit.trees[x];
+  for (int i=0; i<V; i++) {
+    ParseTree root = circuit.trees[i];
+    if (i == x || root == NULL)
       continue;
-    ParseTree t = circuit.trees[v];
-    if (t->root_pipes_w != NULL) {
-      for(int i=0; i<t->pipes_counter; i++) {
-        if (close(t->root_pipes_w[i]) < 0)
+    if (root->root_write_to_var != NULL) {
+      for(int j=0; j<root->pipes_counter; j++) {
+        if (close(root->root_write_to_var[j]) < 0 || close(root->root_read_from_var[j]) < 0)
           looming_doom("CLOSE WRITE PIPES FOR OTHER ROOTS");
       }
     }
   }
-  // Close wrtting descriptors of PNUM leaves (they are propagated so that circut could directly
-  // prompt them to pass their value down the graph)
-  for (int i=0; i<circuit.list_len; i++) {
-    if (circuit.variables[i]->type == PNUM) {
-      if (close(circuit.variables[i]->pnum_pipes[1]) < 0)
-        looming_doom("CLOSE WRITE PIPES FOR A PNUM LEAF");
+  //So now create the processes tree mapping ParseTree of x
+  int w_to_c[2], w_to_p[2];
+  bool parent_proc = false;
+  while (!parent_proc && (self->type == BINARY || self->type == UNARY)) {
+    bool child = false;
+    for (int i=0; i<1+(self->type == BINARY) && !child; i++) {
+      if (pipe(w_to_c) < 0 || pipe(w_to_p)) {
+        looming_doom("PIPES BETWEEN TREE NODES");
+      }
+      switch (fork()) {
+        case -1:
+          looming_doom("FORK IN PROC_NODE");
+        case 0:
+          if (self->is_root && self->root_write_to_var != NULL) { //you're children, dispose root desc
+            for (int j=0; j<self->pipes_counter; j++) {
+              if (close(self->root_write_to_var[j]) < 0 || close(self->root_read_from_var[j]) < 0)
+                looming_doom("CLOSE WRITE TO VARS IN NONROOT");
+            }
+          }
+          // close pipes to grandparent
+          close_pipe_or_perish_any_hope(self->read_from_parent, "GRANDP");
+          close_pipe_or_perish_any_hope(self->write_to_parent, "GRANDP");
+          printf ("ParseTree nr %d ", x);
+          if (i == 0) {
+            printf ("right %d %d\n", self->right->label.var, getpid());
+            self = self->right;
+          }
+          else { //you're the second child
+            close_pipe_or_perish_any_hope(self->right->parent_read_from_me, "LEFT CHILD");
+            close_pipe_or_perish_any_hope(self->right->parent_write_to_me, "LEFT CHILD W");
+            printf ("left %d %d\n", self->left->label.var, getpid());
+            self = self->left;
+          }
+          self->read_from_parent = w_to_c[0];
+          self->write_to_parent = w_to_p[1];
+          self->parent_read_from_me = w_to_p[0];
+          self->parent_write_to_me = w_to_c[1];
+          close_pipe_or_perish_any_hope(self->parent_read_from_me, "CHILD PARENT");
+          close_pipe_or_perish_any_hope(self->parent_write_to_me, "CHILD PARENT W");
+          parent_proc = false;
+          child = true;
+          break;
+        default: ;
+          ParseTree child = (i==0) ? self->right : self->left;
+          child->read_from_parent = w_to_c[0];
+          child->write_to_parent = w_to_p[1];
+          child->parent_read_from_me = w_to_p[0];
+          child->parent_write_to_me = w_to_c[1];
+          close_pipe_or_perish_any_hope(child->read_from_parent, "FROM PARENT WITH ERROR");
+          close_pipe_or_perish_any_hope(child->write_to_parent, "FROM PARENT WITH ERROR W");
+          parent_proc = true;
+      }
     }
   }
-  proc_node(circuit.trees[x], x);
+  //we have the whole tree, so all 'to be propagated' pipes reached thier destination
+  //close copies that missed the point
+  for (int i=0; i<circuit.list_len; i++) {
+    ParseTree node = circuit.variables[i];
+    if (node->type == VAR && !(self->type == VAR && self->id == node->id)) {
+      close_pipe_or_perish_any_hope(node->var_write_to_circuit, "UNNEC VAR CIRC");
+      close_pipe_or_perish_any_hope(node->var_read_from_circuit, "UNNEC VAR CIRC R");
+    }
+    if (node->is_root) {
+      for (int i=0; i<node->pipes_counter; i++) {
+        if (self->type == VAR && self->id == node->id)
+          continue;
+        close_pipe_or_perish_any_hope(node->var_write_to_root[i], "UNNEC TO ROOT");
+        close_pipe_or_perish_any_hope(node->var_read_from_root[i], "UNNEC TO ROOT R");
+      }
+    }
+  }
+  listen(self);
+  for (int i=0; i < 2*(self->type == BINARY) + (self->type == UNARY); i++) {
+    if (wait(0) == -1)
+      looming_doom("WAIT ERR");
+  }
+  sleep(30);
   looming_doom(NULL);
 }
 
-bool can_be_computed(ParseTree t, int *vars) {
-  if (t == NULL)
-    return false;
-  else if (t->type == PNUM)
-    return true;
-  else if (t->type == VAR) {
-    if (vars[t->label.var] <= 5000) //not an inifity - was defined
-      return true;
-    else {
-      ParseTree var = circuit.trees[t->label.var];
-      return can_be_computed(var, vars);
-    }
-  }
-  else if (t->type == BINARY || t->type == UNARY) {
-    return can_be_computed(t->right, vars) && (t->type != BINARY || can_be_computed(t->left, vars));
-  }
-  return false;
-}
-
 void broadcast_to_leaves_and_vars(int *vars, int q) {
-  int mes_id = q-K;
-  for (int x=0; x<circuit.V; x++) {
-    if (vars[x] <= 5000) { //was defined
-      Mes mes;
-      mes.i = mes_id;
-      mes.val = vars[x];
-      write(circuit.trees[x]->write, &mes, sizeof(mes));
-    }
-  }
-  //give sign for leaves to propagate values for i-th query
-  Mes mes;
-  mes.i = mes_id;
-  mes.val = -1;
-  for (int v=0; v<circuit.list_len; v++) {
-    if (circuit.variables[v]->type == PNUM) {
-      write(circuit.variables[v]->pnum_pipes[1], &mes, sizeof(mes));
-    }
-  }
-  for (int x=0; x<circuit.V; x++) {
-    if (circuit.trees[x] != NULL) {
-      write(circuit.trees[x]->write, &mes, sizeof(mes));
-    }
-  }
 }
 
 int main() {
   scanf("%d%d%d", &N, &K, &V);
-  if (init_circuit(V) == 0) {
+  if (init_circuit() == 0) {
     char *line = NULL;
     size_t len = 0;
     for (int k=1; k<=K; k++) {
@@ -535,27 +556,55 @@ int main() {
     if (prepare_non_tree_pipes() < 0) {
       looming_doom("PREP NON TREE PIPES");
     }
-    for (int v=0; v<circuit.V; v++) {
-      if (circuit.trees[v] == NULL)
+    for (int v=0; v<V; v++) {
+      ParseTree root = circuit.trees[v];
+      if (root == NULL)
         continue;
-      int pipes[2];
-      if (pipe(pipes) == -1)
-        looming_doom("PIPE IN CIRC");
-      circuit.trees[v]->read = pipes[0];
-      circuit.trees[v]->write = pipes[1];
+      int w_to_root[2];
+      int w_to_circuit[2];
+      if (pipe(w_to_root) == -1 || pipe(w_to_circuit) == -1)
+        looming_doom("PIPE BETWEEN CIRC AND ROOT");
+      root->parent_read_from_me = w_to_circuit[0];
+      root->write_to_parent = w_to_circuit[1];
+      root->parent_write_to_me = w_to_root[1];
+      root->read_from_parent = w_to_root[0];
       switch (fork()) {
         case -1:
           looming_doom("FORK IN CIRC");
         case 0: //root process of variable v
           for (int i=v; i>=0; i--) {
-            close(circuit.trees[v]->write);
+            close_pipe_or_perish_any_hope(circuit.trees[i]->parent_read_from_me, "ROOT HERE");
+            close_pipe_or_perish_any_hope(circuit.trees[i]->parent_write_to_me, "ROOT HERE W");
           }
-          tree_process(v, N-K); //should not return
+          // you're not a circuit so
+          for (int i=0; i<circuit.list_len; i++) {
+            if (circuit.variables[i]->type == VAR) {
+              close_pipe_or_perish_any_hope(circuit.variables[i]->circuit_write_to_var, "ROOT: CIRCS PIPE");
+              close_pipe_or_perish_any_hope(circuit.variables[i]->circuit_read_from_var, "ROOT: CIRCS PIPE R");
+            }
+          }
+          processes_tree(v); //should not return
         default://circuit 
-          close(circuit.trees[v]->read);
+          close_pipe_or_perish_any_hope(root->write_to_parent, "CIRC: ROOT PIPE");
+          close_pipe_or_perish_any_hope(root->read_from_parent, "CIRC: ROOT PIPE R");
+      }
+    } 
+    // only circuit should step in here
+    for (int i=0; i<circuit.list_len; i++) {
+      ParseTree node = circuit.variables[i];
+      if (node->type == VAR) {
+        close_pipe_or_perish_any_hope(node->var_write_to_circuit, "CIRC: VARW");
+        close_pipe_or_perish_any_hope(node->var_read_from_circuit, "CIRC: VAR READ");
+      }
+      if (node->is_root) {
+        for (int i=0; i<node->pipes_counter; i++) {
+          close_pipe_or_perish_any_hope(node->root_write_to_var[i], "CIRC: ROOTWVAR");
+          close_pipe_or_perish_any_hope(node->root_read_from_var[i], "CIRC: ROOTRVAR");
+          close_pipe_or_perish_any_hope(node->var_write_to_root[i], "CIRC: VARWROOT");
+          close_pipe_or_perish_any_hope(node->var_read_from_root[i], "CIRC: VARRROOT");
+        }
       }
     }
-    // only circuit should step in here
     line = NULL;
     len = 0;
     char *err = NULL;
@@ -588,7 +637,7 @@ int main() {
           }
         }
         if (err == NULL) {
-          if (circuit.trees[0] == NULL || (vars[0]>5000 && !can_be_computed(circuit.trees[0], vars))) {
+          if (circuit.trees[0] == NULL) {
             printf("%d F\n", nr);
           }
           else {
