@@ -69,6 +69,9 @@ typedef struct {
   bool err;
 } Mes;
 
+int const NODES_MAX = 1000;
+int const INFINITY = 5001;
+
 Mes *message = NULL;
 
 int N, K, V, nr;
@@ -80,7 +83,7 @@ int init_circuit() {
   if (circuit.variables == NULL)
     return -1;
   circuit.list_cap = DEFAULT_BUF_CAP;
-  circuit.trees = (ParseTree *) calloc(V, sizeof(*circuit.trees));
+  circuit.trees = (ParseTree *) calloc(NODES_MAX, sizeof(*circuit.trees));
   circuit.topo_ord = (int *) calloc(V, sizeof(*circuit.trees));
   if (circuit.trees == NULL || circuit.topo_ord == NULL)
     return -1;
@@ -172,8 +175,8 @@ ParseTree parse_line(char **line, ParseTree op, ParseTree nop) {
   while (**line != '\0' && (isspace(**line) || **line == '(')) {
     ++(*line);
   }
-  // end of currently processed expression, pop the operator and combine it variable from top, if
-  // the operator is binary one it will have its left child added in the parent of recursion tree
+  // end of currently processed expression, pop the operator and combine it with variable from the top,
+  // if the operator is binary one it will have its left child added in the parent of recursion tree
   if (**line == ')') { 
     ++(*line);
     op->right = nop;
@@ -186,7 +189,7 @@ ParseTree parse_line(char **line, ParseTree op, ParseTree nop) {
       return NULL;
     ParseTree tree = new_tree(nodetype, label);
     if (nodetype == PNUM || nodetype == VAR) {
-      // if its variable or numeral put it on the top of the [nop] stack
+      // if it's variable or numeral put it on the top of the [nop] stack
       return parse_line(line, op, tree);
     }
     else { //nodetype is either BINARY or UNARY
@@ -235,13 +238,13 @@ int dfs(ParseTree tree, int root_id) {
 
 int topo_sort() {
   circuit.topo_ord_len = 0;
-  for (int v=0; v<V; v++) {
+  for (int v=0; v<NODES_MAX; v++) {
     if (circuit.trees[v] != NULL) {
       circuit.trees[v]->visited = false;
       circuit.trees[v]->post = -1;
     }
   }
-  for (int v=0; v<V; v++) {
+  for (int v=0; v<NODES_MAX; v++) {
     if (circuit.trees[v] != NULL && (!(circuit.trees[v]->visited))) {
       if (dfs(circuit.trees[v], v) < 0)
         return -1;
@@ -545,7 +548,7 @@ void listen(ParseTree self, int x) {
 void processes_tree(int x) {
   //Tree x defienietly doesn't need other trees' descriptors to write to var labeled leaves 
   ParseTree self = circuit.trees[x];
-  for (int i=0; i<V; i++) {
+  for (int i=0; i<NODES_MAX; i++) {
     ParseTree root = circuit.trees[i];
     if (i == x || root == NULL) {
       continue;
@@ -608,7 +611,7 @@ void processes_tree(int x) {
       }
     }
   }
-  //we have the whole tree, so all 'to be propagated' pipes reached thier destination
+  //we have the whole tree, so all 'to be propagated' pipes reached thier destination;
   //close copies that missed the point
   for (int i=0; i<circuit.list_len; i++) {
     ParseTree node = circuit.variables[i];
@@ -617,7 +620,7 @@ void processes_tree(int x) {
       close_pipe_or_perish_any_hope(node->var_read_from_circuit, "UNNEC VAR CIRC R");
     } 
   }
-  for (int v=0; v<V; v++) {
+  for (int v=0; v<NODES_MAX; v++) {
     ParseTree node = circuit.trees[v];
     if (node == NULL)
       continue;
@@ -682,10 +685,8 @@ int main() {
     if (prepare_non_tree_pipes() < 0) {
       looming_doom("PREP NON TREE PIPES");
     }
-    for (int v=0; v<V; v++) {
-      ParseTree root = circuit.trees[v];
-      if (root == NULL)
-        continue;
+    for (int v=circuit.topo_ord_len - 1; v>=0; v--) {
+      ParseTree root = circuit.trees[circuit.topo_ord[v]];
       int w_to_root[2];
       int w_to_circuit[2];
       if (pipe(w_to_root) == -1 || pipe(w_to_circuit) == -1)
@@ -698,12 +699,10 @@ int main() {
         case -1:
           looming_doom("FORK IN CIRC");
         case 0: //root process of variable v
-          for (int i=v; i>=0; i--) {
-            ParseTree droot = circuit.trees[i];
-            if (droot == NULL)
-              continue;
-            close_pipe_or_perish_any_hope(circuit.trees[i]->parent_read_from_me, "ROOT HERE");
-            close_pipe_or_perish_any_hope(circuit.trees[i]->parent_write_to_me, "ROOT HERE W");
+          for (int i=v; i < circuit.topo_ord_len; i++) {
+            ParseTree droot = circuit.trees[circuit.topo_ord[i]];
+            close_pipe_or_perish_any_hope(droot->parent_read_from_me, "ROOT HERE");
+            close_pipe_or_perish_any_hope(droot->parent_write_to_me, "ROOT HERE W");
           }
           // you're not a circuit so
           for (int i=0; i<circuit.list_len; i++) {
@@ -712,7 +711,7 @@ int main() {
               close_pipe_or_perish_any_hope(circuit.variables[i]->circuit_read_from_var, "ROOT: CIRCS PIPE R");
             }
           }
-          processes_tree(v); //should not return
+          processes_tree(circuit.topo_ord[v]); //should not return
         default://circuit 
           close_pipe_or_perish_any_hope(root->write_to_parent, "CIRC: ROOT PIPE");
           close_pipe_or_perish_any_hope(root->read_from_parent, "CIRC: ROOT PIPE R");
@@ -739,12 +738,12 @@ int main() {
     line = NULL;
     len = 0;
     char *err = NULL;
-    int *vars = calloc(V*(N-K), sizeof(int));
+    int *vars = calloc(NODES_MAX*(N-K), sizeof(int));
     int *labels = calloc(N-K, sizeof(int));
     if (vars == NULL || labels == NULL)
       looming_doom("VARS");
-    for (int j=0; j<V*(N-K); j++)
-      vars[j] = 5001; //INFINITY
+    for (int j=0; j<NODES_MAX*(N-K); j++)
+      vars[j] = INFINITY; //INFINITY
     for (int i=0; i<N-K && err == NULL; i++) {
       scanf("%d", &nr);
       labels[i] = nr;
@@ -761,11 +760,11 @@ int main() {
         }
         Label labelr;
         NodeType nodetyper = retrieve_var(&mock_line, &labelr); 
-        if (labell.var<0 || labell.var>=V || vars[i*V + labell.var] <= 5000) {
+        if (labell.var<0 || labell.var>=NODES_MAX || vars[i*NODES_MAX + labell.var] < INFINITY) {
           err = "PARSING INIT LIST VAR";
           break;
         }
-        vars[i*V + labell.var] = labelr.var;
+        vars[i*NODES_MAX + labell.var] = labelr.var;
         while (*mock_line != '\0' && isspace(*mock_line)) {
           ++(mock_line); 
         }
@@ -775,8 +774,8 @@ int main() {
     }
     free(line);
     if (circuit.trees[0] == NULL) {
-      for (int i=K; i<N; i++) {
-        printf("%d F\n", i+1);
+      for (int i=0; i<N-K; i++) {
+        printf("%d F\n", labels[i]);
       }
     }
     else {
@@ -797,8 +796,8 @@ int main() {
       }
       int answers = 0;
       for (int i=0; i<N-K; i++) {
-        if (vars[i*V] <= 5000) { //not an infinity
-          printf("%d P %d\n", labels[i], vars[i*V]);
+        if (vars[i*NODES_MAX] < INFINITY) { //not an infinity
+          printf("%d P %d\n", labels[i], vars[i*1000]);
           ++answers;
         }
         else {
@@ -834,8 +833,8 @@ int main() {
                   answers++;
                 }
                 else {
-                  long var = vars[message.i*V + node2write[i]->label.var];
-                  if (var <= 5000) { //not an infinity
+                  long var = vars[message.i*NODES_MAX + node2write[i]->label.var];
+                  if (var < INFINITY) { //not an infinity
                     send_message(node2write[i]->circuit_write_to_var, message.i, var, false);
                   }
                   else {
@@ -852,7 +851,7 @@ int main() {
     }
     free(labels);
     free(vars);
-    for (int v=0; v<V; v++) {
+    for (int v=0; v<NODES_MAX; v++) {
       if (circuit.trees[v] != NULL)
         close(circuit.trees[v]->parent_write_to_me);
     }
