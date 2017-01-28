@@ -250,52 +250,6 @@ int topo_sort() {
   return 0;
 }
 
-/*\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
-void print_tree(ParseTree t) {
-  if(t == NULL) {
-    printf ("UUUUBS!\n");
-    exit(1);
-  }
-  if (t->type == BINARY) {
-    if(t->left == NULL || t->right == NULL) {
-      printf("ERRRR %c %d %d\n", t->label.op, t->left == NULL, t->right==NULL);
-      exit(1);
-    }
-    printf("(");
-    print_tree(t->left);
-    printf(" %c ", t->label.op);
-    print_tree(t->right);
-    printf(")");
-  }
-  else if (t->type == UNARY) {
-    if (t->left != NULL || t->right == NULL) {
-      printf ("ERRR %c %d %d\n", t->label.op, t->left == NULL, t->right == NULL);
-      exit(1);
-    }
-    printf("(%c", t->label.op);
-    print_tree(t->right);
-    printf(")");
-  }
-  else if (t->type == PNUM) {
-    printf("%d", t->label.var);
-  }
-  else if (t->type == VAR) {
-    printf("x[%d]", t->label.var);
-  }
-  else {
-    printf("TYPE!!!!\n");
-    exit(1);
-  }
-}
-
-void print_topo() {
-  for (int v=circuit.topo_ord_len - 1; v>=0; v--) {
-    printf("(%d %d) ", circuit.topo_ord[v], circuit.trees[circuit.topo_ord[v]]->post);
-  }
-  printf("\n");
-}
-\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\*/
-
 // Creates pipes between x root nad x labeled leaf
 int register_pipe(ParseTree varLabeledLeaf) {
   int v = varLabeledLeaf->label.var;
@@ -554,7 +508,6 @@ void listen(ParseTree self, int x) {
     else if (ret > 0) {
       for (int i=0; i<n+oftype; i++) {
         if (entries[i].revents & POLLHUP) {
-          printf("HANGUP %d %d\n", self->id, i);
           finish = true; //pipe is closed
         }
         if (entries[i].revents & (POLLIN | POLLERR)) {
@@ -578,16 +531,11 @@ void listen(ParseTree self, int x) {
               default:
                 looming_doom("NODE TYPE ERR");
             }
-            printf("Message %d %d %d %d %ld %d\n", self->id, len, message.i, self->label.var, message.val, i);
           }
         }
       }
     }
   }
-  //Mes mes;
-    //while (read(self->var_read_from_circuit, &mes, sizeof(mes)))
-      //printf("%d I am x[%d]")
-      //write(parent_dsc, &mes, sizeof(mes));
   free(entries);
   free(cached);
   free(cache_status);
@@ -718,7 +666,6 @@ int main() {
         free(line);
         looming_doom("PARSE ERR");
       }
-      //print_tree(tree);
       circuit.trees[label.var] = tree;
       tree->is_root = true;
       if (topo_sort() < 0) {
@@ -727,10 +674,10 @@ int main() {
         looming_doom(NULL);
       }
       else {
-        //print_topo();
         printf("%d P\n", nr);
       }
     }
+    fflush(stdout);
     free(line);
     if (prepare_non_tree_pipes() < 0) {
       looming_doom("PREP NON TREE PIPES");
@@ -818,7 +765,6 @@ int main() {
           err = "PARSING INIT LIST VAR";
           break;
         }
-        printf ("DDD%d\n", labelr.var);
         vars[i*V + labell.var] = labelr.var;
         while (*mock_line != '\0' && isspace(*mock_line)) {
           ++(mock_line); 
@@ -871,7 +817,6 @@ int main() {
         else if (ret > 0) {
           for (int i=0; i<how_many_labeled_vars + 1; i++) {
             if (entries[i].revents & POLLHUP) {
-              printf("HANGUP CIRC\n");
               finish = true; //pipe is closed
             }
             if (entries[i].revents & (POLLIN | POLLERR)) {
@@ -890,7 +835,6 @@ int main() {
                 }
                 else {
                   long var = vars[message.i*V + node2write[i]->label.var];
-                  printf("VAR: %ld %d\n", var, node2write[i]->label.var);
                   if (var <= 5000) { //not an infinity
                     send_message(node2write[i]->circuit_write_to_var, message.i, var, false);
                   }
@@ -898,7 +842,6 @@ int main() {
                     send_message(node2write[i]->circuit_write_to_var, message.i, 0, true);
                   }
                 }
-                printf("CIRC Message %d %ld %d\n", message.i, message.val, i);
               }
             }
           }
