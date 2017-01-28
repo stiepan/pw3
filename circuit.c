@@ -5,6 +5,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <stdbool.h>
+#include <poll.h>
 #include "err.h"
 
 /* Types and structures to represent circuit */
@@ -34,6 +35,7 @@ typedef struct Node {
   int *root_read_from_var;
   int *var_write_to_root; //var leaves use them to message root
   int *var_read_from_root;
+  bool *root_pending_vars;
   //if node is a leaf labeled with variable it is the index in array of pipes in corresponding tree
   //if there is such a tree of course
   int pipe_id;
@@ -64,7 +66,10 @@ struct Circuit {
 typedef struct {
   int i;
   long val;
+  bool err;
 } Mes;
+
+Mes *message = NULL;
 
 int N, K, V, nr;
 
@@ -96,6 +101,7 @@ void free_circuit() {
   free(circuit.topo_ord);
   free(circuit.trees);
   free(circuit.variables);
+  free(message);
 }
 
 /* Adds [t] to the list of nodes that should be deleted if [free_nodes] is evoked. */
@@ -378,43 +384,213 @@ void close_pipe_or_perish_any_hope(int pipe, char *err) {
     looming_doom(err);
 }
 
-void listen(ParseTree self) {
-  /*if (self->is_root)
-    entries += 1;
-  if (self->type == PNUM || self->type == UNARY)
-    entries += 1;
-  else if (self)
-  if (self->type == PNUM) {
-    Mes mes;
-    while (read(self->pnum_pipes[0], &mes, sizeof(mes)))
-      write(parent_dsc, &mes, sizeof(mes));
-  }*/
+void send_message(int to, int i, long val, bool err) {
+  if (message == NULL)
+    message = calloc(1, sizeof(*message));
+  if (message == NULL) {
+    looming_doom("CALLOC IN SM");
+  }
+  message->i = i;
+  message->val = val;
+  message->err = err;
+  if (write(to, message, sizeof(*message)) <= 0)
+    looming_doom("WRITE IN SM");
 }
 
-/* Map ParseTree to process tree */ 
-void proc_node(ParseTree self, int x) {
-/*  // close propagated descriptors from roots to variable nodes the given root describe
-  // fisrt if you are not a root you do not need non-tree descriptors that your root was given
-  if (!self->is_root) {
-    ParseTree root = circuit.trees[x];
-    for (int i=0; i<root->pipes_counter; i++)
-      close(root->root_pipes_w[i]);
+void pnum_response(ParseTree self, int i, int from) {
+  int write2 = (from == 0)? self->write_to_parent : self->root_write_to_var[from-1]; 
+  send_message(write2, i, self->label.var, false);
+}
+
+void broadcast(ParseTree self, int x, int *cache_status, long *cached, int i, long val, int status) {
+  if (cache_status[i] <= 0) {
+    if (status) {
+      cache_status[i] = 1;
+    }
+    else {
+      cache_status[i] = 2;
+      cached[i] = val;
+    }
   }
-  // if you are a leaf of var v type you should be able to read from tree[v]
-  for (int v=0; v<V; v++) {
-    if (circuit.trees[v] == NULL)
-      continue;
-    ParseTree t = circuit.trees[v];
-    if (t->root_pipes_r != NULL) {
-      for(int i=0; i<t->pipes_counter; i++) {
-        if (self->type == VAR && v == x && i == self->pipe_id)
-          continue;
-        if (close(t->root_pipes_r[i]) < 0)
-          looming_doom("CLOSE WRITE PIPES FOR OTHER ROOTS");
+  if (!self->is_root || x == 0) // trees different than 0 should not respond to parent (circuit)
+    send_message(self->write_to_parent, i, val, status);
+  for (int j=0; j<self->pipes_counter; j++) {
+    send_message(self->root_write_to_var[j], i, val, status);
+  }
+}
+
+void send_cached(ParseTree self, int *cache_status, long *cached, Mes *mes, int from, int n) {
+  if (cache_status[mes->i] > 0) { //already responded for this query
+    if (from < n) { // it was actually a query not some delayed response
+      int write2 = (from == 0) ? self->write_to_parent : self->root_write_to_var[from-1];
+      if (cache_status[mes->i] == 1) { //not possible to compute value with given initial list
+        send_message(write2, mes->i, 0, true);
+      }
+      else {
+        send_message(write2, mes->i, cached[mes->i], false);
       }
     }
   }
-  listen(self, parent);*/
+}
+
+void op_response(ParseTree self, int x, int *cache_status, long *cached, Mes *mes, int from, int n) {
+  if (cache_status[mes->i] > 0) { //already responded for this query
+    send_cached(self, cache_status, cached, mes, from, n);
+  }
+  else if (cache_status[mes->i] == 0) { //know nothing, ask children
+    cache_status[mes->i] = -1;
+    send_message(self->right->parent_write_to_me, mes->i, 0, false);
+    if (self->type == BINARY)
+      send_message(self->left->parent_write_to_me, mes->i, 0, false);
+  }
+  else { //waiting for children's 
+    if (from >= n) { //so only children should be indeed waited on
+      if (mes->err) { // one of the subtrees cannot be comptued with given init list 
+        broadcast(self, x, cache_status, cached, mes->i, 0, true);
+      }
+      else {
+        if (self->type == UNARY) {
+          broadcast(self, x, cache_status, cached, mes->i, -mes->val, false);
+        }
+        else {
+          if (cache_status[mes->i] == -2) {
+            long val = cached[mes->i];
+            val = (self->label.op == '+')? val + mes->val : val * mes->val;
+            broadcast(self, x, cache_status, cached, mes->i, val, false);
+          }
+          else {
+            cache_status[mes->i] = -2;
+            cached[mes->i] = mes->val;
+          }
+        }
+      }
+    }
+  }
+}
+
+void var_response(ParseTree self, int x, int *cache_status, long *cached, Mes *mes, int from, int n) {
+  if (cache_status[mes->i] > 0) { //already responded for this query
+    send_cached(self, cache_status, cached, mes, from, n);
+  }
+  else if (cache_status[mes->i] == 0) { //know nothing, ask circuit
+    cache_status[mes->i] = -1;
+    send_message(self->var_write_to_circuit, mes->i, 0, false);
+  }
+  else if (cache_status[mes->i] == -1) { //waiting for circuit response
+    if (from == n) { //so only circuit should be indeed waited on
+      if (!mes->err) {
+        broadcast(self, x, cache_status, cached, mes->i, mes->val, false);
+      }
+      else { //there was no value in the init list for this variable
+        ParseTree treevar = circuit.trees[self->label.var];
+        if (treevar == NULL) {
+          broadcast(self, x, cache_status, cached, mes->i, 0, true);
+        }
+        else {
+          cache_status[mes->i] = -2;
+          send_message(treevar->var_write_to_root[self->pipe_id], mes->i, 0, false);
+        }
+      }
+    }
+  }
+  else if (cache_status[mes->i] == -2) { //waiting for the response from root repesenting var's label
+    if (from == n+1) {
+      broadcast(self, x, cache_status, cached, mes->i, mes->val, mes->err);
+    }
+  }
+}
+
+void listen(ParseTree self, int x) {
+  int *cache_status = NULL;
+  long *cached = NULL;
+  struct pollfd *entries = NULL;
+  Mes message;
+  if (self->type != PNUM) {
+    cache_status = calloc(N-K, sizeof(int));
+    cached = calloc(N-K, sizeof(long));
+    if (cache_status == NULL || cached == NULL)
+      looming_doom("CACHE CALLOC");
+  }
+  //readpoll table: [parentNode][pipes from var leaves if you are a root][var/opartor pipes]
+  size_t n=1;
+  if (self->is_root) {
+    n += self->pipes_counter;
+  }
+  int oftype = 0;
+  entries = calloc(n+2, sizeof(*entries));
+  entries[0].fd = self->read_from_parent;
+  entries[0].events = POLLIN;
+  for (int i=0; i<self->pipes_counter; i++) {
+    entries[i+1].events = POLLIN;
+    entries[i+1].fd = self->root_read_from_var[i];
+  }
+  if (self->type == BINARY || self->type == UNARY) {
+    entries[n+oftype].events = POLLIN;
+    entries[n+oftype].fd = self->right->parent_read_from_me;
+    oftype += 1;
+    if (self->type == BINARY) {
+      entries[n+oftype].events = POLLIN;
+      entries[n+(oftype++)].fd = self->left->parent_read_from_me;
+    }
+  }
+  else if (self->type == VAR) {
+    entries[n+oftype].events = POLLIN;
+    entries[n+oftype++].fd = self->var_read_from_circuit;
+    ParseTree treevar = circuit.trees[self->label.var];
+    if (treevar != NULL) {
+      entries[n+oftype].events = POLLIN;
+      entries[n+oftype].fd = treevar->var_read_from_root[self->pipe_id];
+      oftype += 1;
+    }
+  }
+  bool finish = false;
+  int ret, len;
+  while (!finish) {
+    for (int i=0; i<n+oftype; i++)
+      entries[i].revents = 0;
+    if ((ret = poll(entries, n+oftype, -1)) < 0) {
+      looming_doom ("POLL READ CHILD");
+    }
+    else if (ret > 0) {
+      for (int i=0; i<n+oftype; i++) {
+        if (entries[i].revents & POLLHUP) {
+          printf("HANGUP %d %d\n", self->id, i);
+          finish = true; //pipe is closed
+        }
+        if (entries[i].revents & (POLLIN | POLLERR)) {
+          if ((len = read(entries[i].fd, &message, sizeof(message))) == -1)
+            looming_doom("READ IN CHILD");
+          if (len == 0) {
+            finish = true;
+          }
+          else {
+            switch(self->type) {
+              case PNUM:
+                pnum_response(self, message.i, i);
+                break;
+              case VAR:
+                var_response(self, x, cache_status, cached, &message, i, n);
+                break;
+              case BINARY:
+              case UNARY:
+                op_response(self, x, cache_status, cached, &message, i, n);
+                break;
+              default:
+                looming_doom("NODE TYPE ERR");
+            }
+            printf("Message %d %d %d %d %ld %d\n", self->id, len, message.i, self->label.var, message.val, i);
+          }
+        }
+      }
+    }
+  }
+  //Mes mes;
+    //while (read(self->var_read_from_circuit, &mes, sizeof(mes)))
+      //printf("%d I am x[%d]")
+      //write(parent_dsc, &mes, sizeof(mes));
+  free(entries);
+  free(cached);
+  free(cache_status);
 }
 
 /* x:{X[0], .., X[V-1]} */
@@ -423,8 +599,9 @@ void processes_tree(int x) {
   ParseTree self = circuit.trees[x];
   for (int i=0; i<V; i++) {
     ParseTree root = circuit.trees[i];
-    if (i == x || root == NULL)
+    if (i == x || root == NULL) {
       continue;
+    }
     if (root->root_write_to_var != NULL) {
       for(int j=0; j<root->pipes_counter; j++) {
         if (close(root->root_write_to_var[j]) < 0 || close(root->root_read_from_var[j]) < 0)
@@ -454,15 +631,12 @@ void processes_tree(int x) {
           // close pipes to grandparent
           close_pipe_or_perish_any_hope(self->read_from_parent, "GRANDP");
           close_pipe_or_perish_any_hope(self->write_to_parent, "GRANDP");
-          printf ("ParseTree nr %d ", x);
           if (i == 0) {
-            printf ("right %d %d\n", self->right->label.var, getpid());
             self = self->right;
           }
           else { //you're the second child
             close_pipe_or_perish_any_hope(self->right->parent_read_from_me, "LEFT CHILD");
             close_pipe_or_perish_any_hope(self->right->parent_write_to_me, "LEFT CHILD W");
-            printf ("left %d %d\n", self->left->label.var, getpid());
             self = self->left;
           }
           self->read_from_parent = w_to_c[0];
@@ -493,27 +667,32 @@ void processes_tree(int x) {
     if (node->type == VAR && !(self->type == VAR && self->id == node->id)) {
       close_pipe_or_perish_any_hope(node->var_write_to_circuit, "UNNEC VAR CIRC");
       close_pipe_or_perish_any_hope(node->var_read_from_circuit, "UNNEC VAR CIRC R");
-    }
-    if (node->is_root) {
-      for (int i=0; i<node->pipes_counter; i++) {
-        if (self->type == VAR && self->id == node->id)
-          continue;
-        close_pipe_or_perish_any_hope(node->var_write_to_root[i], "UNNEC TO ROOT");
-        close_pipe_or_perish_any_hope(node->var_read_from_root[i], "UNNEC TO ROOT R");
-      }
+    } 
+  }
+  for (int v=0; v<V; v++) {
+    ParseTree node = circuit.trees[v];
+    if (node == NULL)
+      continue;
+    for (int i=0; i<node->pipes_counter; i++) {
+      if (self->type == VAR && self->label.var == v && self->pipe_id == i)
+        continue;
+      close_pipe_or_perish_any_hope(node->var_write_to_root[i], "UNNEC TO ROOT");
+      close_pipe_or_perish_any_hope(node->var_read_from_root[i], "UNNEC TO ROOT R");
     }
   }
-  listen(self);
+  listen(self, x);
+  if (self->type == BINARY || self->type == UNARY) {
+    close(self->right->parent_write_to_me);
+    if (self->type == BINARY)
+      close(self->left->parent_write_to_me);
+  }
   for (int i=0; i < 2*(self->type == BINARY) + (self->type == UNARY); i++) {
     if (wait(0) == -1)
       looming_doom("WAIT ERR");
   }
-  sleep(30);
   looming_doom(NULL);
 }
 
-void broadcast_to_leaves_and_vars(int *vars, int q) {
-}
 
 int main() {
   scanf("%d%d%d", &N, &K, &V);
@@ -573,6 +752,9 @@ int main() {
           looming_doom("FORK IN CIRC");
         case 0: //root process of variable v
           for (int i=v; i>=0; i--) {
+            ParseTree droot = circuit.trees[i];
+            if (droot == NULL)
+              continue;
             close_pipe_or_perish_any_hope(circuit.trees[i]->parent_read_from_me, "ROOT HERE");
             close_pipe_or_perish_any_hope(circuit.trees[i]->parent_write_to_me, "ROOT HERE W");
           }
@@ -589,10 +771,12 @@ int main() {
           close_pipe_or_perish_any_hope(root->read_from_parent, "CIRC: ROOT PIPE R");
       }
     } 
+    size_t how_many_labeled_vars = 0;
     // only circuit should step in here
     for (int i=0; i<circuit.list_len; i++) {
       ParseTree node = circuit.variables[i];
       if (node->type == VAR) {
+        ++how_many_labeled_vars;
         close_pipe_or_perish_any_hope(node->var_write_to_circuit, "CIRC: VARW");
         close_pipe_or_perish_any_hope(node->var_read_from_circuit, "CIRC: VAR READ");
       }
@@ -608,47 +792,126 @@ int main() {
     line = NULL;
     len = 0;
     char *err = NULL;
-    int *vars = calloc(V, sizeof(int));
-    if (vars != NULL) { 
-      for (int i=0; i<N-K && err == NULL; i++) {
-        scanf("%d", &nr);
-        if (getline(&line, &len, stdin) < 0) {
-          err = "GETLINE 2";
+    int *vars = calloc(V*(N-K), sizeof(int));
+    int *labels = calloc(N-K, sizeof(int));
+    if (vars == NULL || labels == NULL)
+      looming_doom("VARS");
+    for (int j=0; j<V*(N-K); j++)
+      vars[j] = 5001; //INFINITY
+    for (int i=0; i<N-K && err == NULL; i++) {
+      scanf("%d", &nr);
+      labels[i] = nr;
+      if (getline(&line, &len, stdin) < 0) {
+        err = "GETLINE 2";
+        break;
+      }
+      char *mock_line = line;
+      while (*mock_line != '\0' && err == NULL) {
+        Label labell;
+        NodeType nodetypel = retrieve_var(&mock_line, &labell); 
+        if (nodetypel != VAR) {
           break;
         }
-        for (int j=0; j<V; j++)
-          vars[j] = 5001; //INFINITY
-        char *mock_line = line;
-        while (*mock_line != '\0' && err == NULL) {
-          Label labell;
-          NodeType nodetypel = retrieve_var(&mock_line, &labell); 
-          if (nodetypel != VAR) {
-            break;
-          }
-          Label labelr;
-          NodeType nodetyper = retrieve_var(&mock_line, &labelr); 
-          if (labell.var<0 || labell.var>=V || vars[labell.var] <= 5000) {
-            err = "PARSING INIT LIST VAR";
-            break;
-          }
-          vars[labell.var] = labelr.var;
-          while (*mock_line != '\0' && isspace(*mock_line)) {
-            ++(mock_line); 
-          }
+        Label labelr;
+        NodeType nodetyper = retrieve_var(&mock_line, &labelr); 
+        if (labell.var<0 || labell.var>=V || vars[i*V + labell.var] <= 5000) {
+          err = "PARSING INIT LIST VAR";
+          break;
         }
-        if (err == NULL) {
-          if (circuit.trees[0] == NULL) {
-            printf("%d F\n", nr);
-          }
-          else {
-            broadcast_to_leaves_and_vars(vars, nr);
+        printf ("DDD%d\n", labelr.var);
+        vars[i*V + labell.var] = labelr.var;
+        while (*mock_line != '\0' && isspace(*mock_line)) {
+          ++(mock_line); 
+        }
+      }
+      if (err != NULL)
+        looming_doom(err);
+    }
+    free(line);
+    if (circuit.trees[0] == NULL) {
+      for (int i=K; i<N; i++) {
+        printf("%d F\n", i+1);
+      }
+    }
+    else {
+      Mes message;
+      struct pollfd *entries = calloc(how_many_labeled_vars + 1, sizeof(struct pollfd));
+      ParseTree *node2write = calloc(how_many_labeled_vars + 1, sizeof(ParseTree));
+      entries[0].fd = circuit.trees[0]->parent_read_from_me;
+      entries[0].events = POLLIN;
+      node2write[0] = circuit.trees[0];
+      size_t entq = 1;
+      for (int i=0; i<circuit.list_len; i++) {
+        ParseTree node = circuit.variables[i];
+        if (node->type == VAR) {
+          entries[entq].fd = node->circuit_read_from_var;
+          entries[entq].events = POLLIN;
+          node2write[entq++] = node;
+        }
+      }
+      int answers = 0;
+      for (int i=0; i<N-K; i++) {
+        if (vars[i*V] <= 5000) { //not an infinity
+          printf("%d P %d\n", labels[i], vars[i*V]);
+          ++answers;
+        }
+        else {
+          send_message(node2write[0]->parent_write_to_me, i, -1, false);
+        }
+      }
+      int ret;
+      bool finish = false;
+      while (answers < N-K && !finish) {  
+        for (int i=0; i<how_many_labeled_vars + 1; i++)
+          entries[i].revents = 0;
+        ret = poll(entries, how_many_labeled_vars + 1, -1);
+        if ((ret) < 0) {
+          looming_doom ("POLL READ CIRC");
+        }
+        else if (ret > 0) {
+          for (int i=0; i<how_many_labeled_vars + 1; i++) {
+            if (entries[i].revents & POLLHUP) {
+              printf("HANGUP CIRC\n");
+              finish = true; //pipe is closed
+            }
+            if (entries[i].revents & (POLLIN | POLLERR)) {
+              if ((len = read(entries[i].fd, &message, sizeof(message))) == -1)
+                looming_doom("READ IN CIRC");
+              if (len == 0) {
+                finish = true;
+              }
+              else {
+                if (i == 0) {
+                  if (message.err)
+                    printf("%d F\n", labels[message.i]);
+                  else
+                    printf("%d P %ld\n", labels[message.i], message.val);
+                  answers++;
+                }
+                else {
+                  long var = vars[message.i*V + node2write[i]->label.var];
+                  printf("VAR: %ld %d\n", var, node2write[i]->label.var);
+                  if (var <= 5000) { //not an infinity
+                    send_message(node2write[i]->circuit_write_to_var, message.i, var, false);
+                  }
+                  else {
+                    send_message(node2write[i]->circuit_write_to_var, message.i, 0, true);
+                  }
+                }
+                printf("CIRC Message %d %ld %d\n", message.i, message.val, i);
+              }
+            }
           }
         }
       }
-      free(line);
-      free(vars);
-      if (err != NULL)
-        looming_doom(err);
+      free(node2write);
+      free(entries);
+    }
+    free(labels);
+    free(vars);
+    for (int v=0; v<V; v++) {
+      if (circuit.trees[v] != NULL)
+        close(circuit.trees[v]->parent_write_to_me);
     }
     // Wait for roots
     for (int i=0; i<circuit.topo_ord_len; i++) {
